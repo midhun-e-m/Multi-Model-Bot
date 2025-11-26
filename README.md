@@ -186,15 +186,3 @@ Add support for more models (OpenAI, local models, etc.).
 
 Dockerize backend + frontend for easy deployment.
 
-📝 License
-Add your preferred license here (MIT, Apache-2.0, etc.).
-
-yaml
-Copy code
-
----
-
-If you want, next step I can also:
-
-- Give you a `requirements.txt` for this exact project.
-- Give you a `.gitignore` that ignores `.env`, `router_database.db`, and `__pycache__`.

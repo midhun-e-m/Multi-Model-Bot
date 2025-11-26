@@ -1,117 +1,183 @@
 import streamlit as st
 import requests
+import uuid
+import time
+from requests.exceptions import ConnectionError, Timeout
 
-# ---------------- CONFIGURATION ----------------
-BACKEND_URL = "http://localhost:8000/chat"
+# --- CONFIG ---
+BASE_URL = "http://localhost:8000"
 
 st.set_page_config(
-    page_title="Hybrid AI Chat", 
-    page_icon="🤖",
-    layout="wide"  # 'wide' layout looks more like a real app
+    page_title="Nexus AI", 
+    page_icon="🔮", 
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# ---------------- SIDEBAR (The "Gemini/ChatGPT" Style) ----------------
-with st.sidebar:
-    st.title("🤖 Hybrid AI")
-    
-    # 1. Action Buttons
-    if st.button("➕ New Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-
-    st.markdown("---")
-    
-    # 2. Settings / Info
-    st.subheader("⚙️ System Architecture")
-    st.markdown("""
-    - **🧠 Router:** Fast API (Auto-detect)
-    - **⚡ Text:** Groq (Llama 3)
-    - **🎨 Image:** Google Gemini (Imagen)
-    - **🛡️ Backup:** Pollinations.ai
-    """)
-    
-    st.markdown("---")
-    
-    # 3. Status Indicator (Optional Visual)
-    st.success("🟢 System Online")
-
-# ---------------- MAIN CHAT INTERFACE ----------------
-
-# Custom CSS to make it look cleaner (optional)
+# --- CSS STYLING ---
 st.markdown("""
-    <style>
-    .stChatMessage {background-color: transparent;} 
-    /* Hide the default Streamlit top menu for a cleaner look */
+<style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    </style>
-    """, unsafe_allow_html=True)
+    .stButton>button {border-radius: 8px; font-weight: 600;}
+    .stChatMessage {border-radius: 15px; padding: 1rem; margin-bottom: 0.5rem;}
+    [data-testid="stSidebar"] h1 {
+        background: -webkit-linear-gradient(45deg, #FE6B8B 30%, #FF8E53 90%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 2.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-st.title("💬 Multi Model ChatBot")
-st.caption("🚀 Powered by Groq & Gemini")
+# --- STATE INIT ---
+if "token" not in st.session_state: st.session_state.token = None
+if "user" not in st.session_state: st.session_state.user = None
+if "current_session_id" not in st.session_state: st.session_state.current_session_id = str(uuid.uuid4())
+if "messages" not in st.session_state: st.session_state.messages = []
 
-# ---------------- SESSION STATE ----------------
-if "messages" not in st.session_state:
+# --- HELPERS ---
+def get_headers():
+    return {"Authorization": f"Bearer {st.session_state.token}"}
+
+def load_session_messages(session_id):
+    try:
+        # Increased timeout to 10s for history fetching
+        resp = requests.get(f"{BASE_URL}/history/{session_id}", headers=get_headers(), timeout=10)
+        if resp.status_code == 200:
+            st.session_state.messages = []
+            for h in resp.json():
+                st.session_state.messages.append({"role": "user", "type": "text", "content": h["prompt"]})
+                rtype = "image" if "http" in h["response"] or "data:image" in h["response"] else "text"
+                st.session_state.messages.append({"role": "assistant", "type": rtype, "content": h["response"]})
+            st.session_state.current_session_id = session_id
+            st.rerun()
+    except Exception as e:
+        st.error(f"Could not load history: {e}")
+
+def create_new_chat():
+    st.session_state.current_session_id = str(uuid.uuid4())
     st.session_state.messages = []
+    st.rerun()
 
-# ---------------- RENDER HISTORY ----------------
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        if message["type"] == "text":
-            st.markdown(message["content"])
-        elif message["type"] == "image":
-            st.image(message["content"], caption="Generated Image", use_column_width=True)
-            if "meta" in message:
-                with st.expander("🔍 See Model Details"):
-                    st.json(message["meta"])
+# --- PAGES ---
+def login_page():
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    with col2:
+        st.title("🔮 Nexus AI")
+        st.markdown("##### The Multi-Model Intelligence Hub")
+        
+        tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
+        
+        with tab1:
+            with st.form("login"):
+                u = st.text_input("Username")
+                p = st.text_input("Password", type="password")
+                if st.form_submit_button("Access System", use_container_width=True):
+                    try:
+                        r = requests.post(f"{BASE_URL}/token", data={"username": u, "password": p}, timeout=5)
+                        if r.status_code == 200:
+                            st.session_state.token = r.json()["access_token"]
+                            st.session_state.user = u
+                            st.success("Verified. Redirecting...")
+                            time.sleep(0.5)
+                            # RERUN MUST BE OUTSIDE OR HANDLED CAREFULLY
+                            st.rerun() 
+                        else:
+                            st.error("Invalid Credentials")
+                    except ConnectionError:
+                        st.error("❌ Cannot connect to Backend. Is 'main.py' running?")
+                    except Timeout:
+                        st.error("❌ Server took too long to respond.")
+                    except Exception as e:
+                        # This catches weird errors, but we ignore the Rerun exception if it slips through
+                        if "script" not in str(e).lower(): 
+                            st.error(f"Error: {e}")
 
-# ---------------- INPUT HANDLER ----------------
-if prompt := st.chat_input("Type a message..."):
-    
-    # 1. Display User Message
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
+        with tab2:
+            with st.form("reg"):
+                u = st.text_input("New Username")
+                p = st.text_input("New Password", type="password")
+                if st.form_submit_button("Initialize Account", use_container_width=True):
+                    try:
+                        r = requests.post(f"{BASE_URL}/register", json={"username": u, "password": p}, timeout=5)
+                        if r.status_code == 200: st.success("Identity Created. Proceed to Login.")
+                        else: st.error(r.text)
+                    except Exception as e: st.error(f"Error: {e}")
 
-    # 2. Call Backend
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                response = requests.post(
-                    BACKEND_URL, 
-                    json={"prompt": prompt, "mode": "auto"},
-                    timeout=60
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    output = data["output"]
-                    result = output["result"]
-                    
-                    # Check content type
-                    content_type = result.get("type", "text")
-                    
-                    if content_type == "image":
-                        image_url = result.get("image_url")
-                        st.image(image_url, caption=f"Generated by {data['provider']}", use_column_width=True)
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "type": "image", 
-                            "content": image_url,
-                            "meta": data
-                        })
-                    else:
-                        text_content = result.get("text", "No response text")
-                        st.markdown(text_content)
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "type": "text", 
-                            "content": text_content
-                        })
-                else:
-                    st.error(f"Error {response.status_code}: {response.text}")
+def chat_page():
+    with st.sidebar:
+        st.title("🔮 Nexus")
+        st.caption(f"User: **{st.session_state.user}**")
+        if st.button("➕ Start New Session", use_container_width=True): create_new_chat()
+        
+        st.divider()
+        st.subheader("🗂️ Archives")
+        try:
+            # Timeout added here too
+            sessions = requests.get(f"{BASE_URL}/sessions", headers=get_headers(), timeout=5).json()
+            if not sessions: st.info("No archives.")
+            for s in sessions:
+                title = s['title'][:25] + "..." if len(s['title']) > 25 else s['title']
+                if s['id'] == st.session_state.current_session_id: st.markdown(f"**👉 {title}**")
+                else: 
+                    if st.button(f"🗨️ {title}", key=s['id']): load_session_messages(s['id'])
+        except: st.warning("Archives offline")
+        
+        st.divider()
+        if st.button("🔌 Disconnect", use_container_width=True):
+            st.session_state.token = None
+            st.rerun()
 
-            except requests.exceptions.ConnectionError:
-                st.error("❌ Could not connect to backend. Is 'app.py' running?")
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+    if not st.session_state.messages:
+        st.title("System Ready.")
+        st.markdown(f"Welcome back, **{st.session_state.user}**.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🐍 Python Code", use_container_width=True):
+                st.session_state.messages.append({"role": "user", "type": "text", "content": "Write a Python script for a calculator."})
+                st.rerun()
+        with col2:
+            if st.button("🎨 Cyberpunk City", use_container_width=True):
+                st.session_state.messages.append({"role": "user", "type": "text", "content": "Generate a cyberpunk city with neon lights."})
+                st.rerun()
+
+    for msg in st.session_state.messages:
+        avatar = "👤" if msg["role"] == "user" else "🔮"
+        with st.chat_message(msg["role"], avatar=avatar):
+            if msg["type"] == "text": st.markdown(msg["content"])
+            else: st.image(msg["content"], width=500)
+
+    if prompt := st.chat_input("Input command..."):
+        st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
+        with st.chat_message("user", avatar="👤"): st.markdown(prompt)
+
+        with st.chat_message("assistant", avatar="🔮"):
+            with st.spinner("Processing..."):
+                try:
+                    # INCREASED TIMEOUT TO 60 SECONDS FOR IMAGES
+                    r = requests.post(
+                        f"{BASE_URL}/chat", 
+                        json={"prompt": prompt, "session_id": st.session_state.current_session_id}, 
+                        headers=get_headers(),
+                        timeout=60 
+                    )
+                    if r.status_code == 200:
+                        out = r.json()["output"]
+                        if "image_url" in out:
+                            st.image(out["image_url"], width=500)
+                            st.session_state.messages.append({"role": "assistant", "type": "image", "content": out["image_url"]})
+                        else:
+                            st.markdown(out["text"])
+                            st.session_state.messages.append({"role": "assistant", "type": "text", "content": out["text"]})
+                    elif r.status_code == 401:
+                        st.session_state.token = None
+                        st.rerun()
+                    else: st.error(f"Error: {r.text}")
+                except Timeout:
+                    st.error("The model took too long to respond. Try again.")
+                except Exception as e: 
+                    st.error(f"Error: {e}")
+
+if st.session_state.token: chat_page()
+else: login_page()

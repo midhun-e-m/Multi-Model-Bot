@@ -1,207 +1,221 @@
-"""
-Multi-model AI Router (Fixed & Functional)
-
-Features:
-- ⚡ Groq (Llama 3) for high-speed Text
-- 🎨 Google Gemini (Imagen 3) for Image Generation
-- 🛡️ Pollinations.ai (Backup) ensures images always work even if keys fail
-"""
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
 import os
 import asyncio
 import httpx
-import base64
+from typing import Optional, Dict, Any, List, Set
+from datetime import datetime, timedelta
+
+# PIP INSTALL: fastapi uvicorn sqlmodel passlib[bcrypt] python-jose groq google-generativeai python-dotenv argon2-cffi
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from sqlmodel import Field, Session, SQLModel, create_engine, select
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 from groq import Groq
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
-app = FastAPI(title="Multi-model AI Router")
+# ================= CONFIGURATION =================
+SECRET_KEY = os.getenv("SECRET_KEY", "super_secret_key")
+ALGORITHM = "HS256"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# -------------------- Config / Environment --------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY: genai.configure(api_key=GEMINI_API_KEY)
 
-# Configure Google GenAI for Text
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# ================= DATABASE MODELS =================
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True)
+    hashed_password: str
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "info": "POST /chat -> {'prompt': '...', 'mode': 'auto'}"}
-
-# -------------------- Request/Response Models --------------------
-class ChatRequest(BaseModel):
+class ChatHistory(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    session_id: str = Field(index=True)
     prompt: str
-    mode: Optional[str] = "auto"
-
-class ChatResponse(BaseModel):
+    response: str
     model_used: str
-    provider: str
-    output: Dict[str, Any]
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-# -------------------- Classifier --------------------
-IMAGE_KEYWORDS = {
-    "image", "generate", "draw", "create", "illustrate", "picture",
-    "logo", "avatar", "portrait", "scene", "render", "paint", "sketch","photo","photograph",
-    "visual", "graphic", "design","cinematic","4k","8k","ultra hd"
+sqlite_file_name = "router_database.db"
+engine = create_engine(f"sqlite:///{sqlite_file_name}", connect_args={"check_same_thread": False})
+
+def create_db_and_tables(): SQLModel.metadata.create_all(engine)
+def get_session():
+    with Session(engine) as session: yield session
+
+# ================= AUTHENTICATION =================
+# Using "argon2" for better compatibility than bcrypt
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def get_password_hash(p): return pwd_context.hash(p)
+def verify_password(p, h): return pwd_context.verify(p, h)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=60)})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username: raise HTTPException(status_code=401)
+    except JWTError: raise HTTPException(status_code=401)
     
-}
-CODE_KEYWORDS = {"code", "python", "function", "script", "bug", "algorithm","c","c++","java",
-                 "javascript","html","css","ruby","go","rust","typescript"}
+    user = session.exec(select(User).where(User.username == username)).first()
+    if not user: raise HTTPException(status_code=401)
+    return user
 
-def classify_prompt(prompt: str) -> str:
-    pl = prompt.lower()
-    # If user specifically asks to "draw code" or "write code", prioritize code
-    if any(w in pl for w in CODE_KEYWORDS) and "image" not in pl:
-        return "code"
-    # Check for image keywords
-    for w in IMAGE_KEYWORDS:
-        if w in pl:
-            return "image"
-    return "text"
-
-# -------------------- Adapters --------------------
+# ================= AI ADAPTERS =================
 class BaseAdapter:
     name: str
     provider: str
-    async def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        raise NotImplementedError
+    async def generate(self, prompt: str) -> Dict[str, Any]: raise NotImplementedError
 
 class GroqAdapter(BaseAdapter):
     name = "llama-3.3-70b-versatile"
     provider = "groq"
-
-    def __init__(self):
-        self.client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-    async def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        if not self.client:
-            raise RuntimeError("GROQ_API_KEY not set")
-
+    def __init__(self): self.client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    
+    async def generate(self, prompt: str) -> Dict[str, Any]:
+        if not self.client: raise RuntimeError("GROQ_API_KEY missing")
         loop = asyncio.get_running_loop()
-        def call_groq():
-            try:
-                # Force JSON mode if needed, otherwise standard text
-                completion = self.client.chat.completions.create(
-                    model=self.name,
-                    messages=[
-                        {"role": "system", "content": "You are a helpful AI assistant."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=1024,
-                )
-                return completion.choices[0].message.content
-            except Exception as e:
-                return {"error": str(e)}
-
-        result = await loop.run_in_executor(None, call_groq)
-        if isinstance(result, dict) and "error" in result:
-            raise Exception(result["error"])
-        return {"text": result, "type": "text"}
-
+        def call():
+            return self.client.chat.completions.create(
+                model=self.name, messages=[{"role": "user", "content": prompt}]
+            ).choices[0].message.content
+        return {"text": await loop.run_in_executor(None, call), "type": "text"}
 
 class GeminiImageAdapter(BaseAdapter):
     name = "imagen-3.0-generate-001"
     provider = "google-gemini"
     
-    async def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        if not GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY not set")
-
-        # 1. Try Official Google Imagen 3 (REST API)
-        # Note: This requires your API Key to be whitelisted for Imagen 3.
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.name}:predict"
-        payload = {
-            "instances": [{"prompt": prompt}],
-            "parameters": {"sampleCount": 1, "aspectRatio": "1:1"}
-        }
+    async def generate(self, prompt: str) -> Dict[str, Any]:
+        # 1. Try Google Gemini
+        if GEMINI_API_KEY:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.name}:predict"
+            headers = {"x-goog-api-key": GEMINI_API_KEY}
+            payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1, "aspectRatio": "1:1"}}
+            async with httpx.AsyncClient() as client:
+                try:
+                    resp = await client.post(url, json=payload, headers=headers)
+                    if resp.status_code == 200:
+                        b64 = resp.json()['predictions'][0]['bytesBase64Encoded']
+                        return {"image_url": f"data:image/png;base64,{b64}", "type": "image"}
+                except: pass
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers={"x-goog-api-key": GEMINI_API_KEY}
-                )
-                
-                if resp.status_code == 200:
-                    data = resp.json()
-                    b64_image = data["predictions"][0]["bytesBase64Encoded"]
-                    return {"image_url": f"data:image/png;base64,{b64_image}", "type": "image"}
-                
-                # If 404/403, the key isn't whitelisted for Imagen. Fallback to Pollinations.
-                print(f"Gemini Imagen failed ({resp.status_code}). Switching to backup.")
-            except Exception as e:
-                print(f"Gemini connection failed: {e}")
+        # 2. Fallback
+        return {"image_url": f"https://image.pollinations.ai/prompt/{prompt.replace(' ', '%20')}", "type": "image"}
 
-        # 2. Fallback: Pollinations.ai (No Key Required)
-        # This ensures your frontend NEVER breaks.
-        print("Using Pollinations.ai fallback")
-        encoded_prompt = prompt.replace(" ", "%20")
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        return {
-            "image_url": image_url, 
-            "type": "image", 
-            "note": "Generated via Fallback (Pollinations) due to Gemini permissions."
-        }
-
-
-# -------------------- Router Logic --------------------
 GROQ_ADAPTER = GroqAdapter()
 GEMINI_ADAPTER = GeminiImageAdapter()
 
-async def select_adapter(prompt: str, mode_hint: Optional[str] = "auto"):
-    classification = classify_prompt(prompt)
-    
-    # Explicit Hint Overrides
-    if mode_hint == "image":
-        return GEMINI_ADAPTER, {"reason": "user_hint_image"}
-    if mode_hint == "text":
-        return GROQ_ADAPTER, {"reason": "user_hint_text"}
+# ================= ROUTER LOGIC (RESTORED) =================
+IMAGE_KEYWORDS = {
+    "image", "generate", "draw", "create", "illustrate", "picture",
+    "logo", "avatar", "portrait", "scene", "render", "paint", "sketch",
+    "photo", "photograph", "visual", "graphic", "design", "cinematic", "4k"
+}
 
-    # Automatic Routing
-    if classification == "image":
-        return GEMINI_ADAPTER, {"reason": "keyword_image"}
+def determine_adapter(prompt: str, mode_hint: str) -> BaseAdapter:
+    # 1. Force Hint
+    if mode_hint == "image": return GEMINI_ADAPTER
+    if mode_hint == "text": return GROQ_ADAPTER
     
-    return GROQ_ADAPTER, {"reason": "default_text"}
+    # 2. Keyword Search
+    prompt_lower = prompt.lower()
+    
+    # If explicitly asking for code, force text even if "image" is mentioned
+    if "code" in prompt_lower or "function" in prompt_lower:
+        return GROQ_ADAPTER
+        
+    # Check for image triggers
+    for word in IMAGE_KEYWORDS:
+        if word in prompt_lower:
+            return GEMINI_ADAPTER
+            
+    # Default to text
+    return GROQ_ADAPTER
 
-# -------------------- API Endpoint --------------------
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    prompt = req.prompt
-    adapter, meta = await select_adapter(prompt, req.mode)
+# ================= API ROUTES =================
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup(): create_db_and_tables()
+
+# --- Auth Routes ---
+@app.post("/register")
+def register(user: dict, session: Session = Depends(get_session)):
+    if session.exec(select(User).where(User.username == user['username'])).first():
+        raise HTTPException(400, "Username taken")
+    session.add(User(username=user['username'], hashed_password=get_password_hash(user['password'])))
+    session.commit()
+    return {"msg": "Created"}
+
+@app.post("/token")
+def login(form: OAuth2PasswordRequestForm = Depends(), session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == form.username)).first()
+    if not user or not verify_password(form.password, user.hashed_password):
+        raise HTTPException(400, "Bad creds")
+    return {"access_token": create_access_token(data={"sub": user.username}), "token_type": "bearer"}
+
+# --- Chat Routes ---
+class ChatRequest(BaseModel):
+    prompt: str
+    session_id: str
+    mode: Optional[str] = "auto"
+
+@app.post("/chat")
+async def chat(req: ChatRequest, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    # 1. Use the robust switching logic
+    adapter = determine_adapter(req.prompt, req.mode)
     
     try:
+        # 2. Generate
+        out = await adapter.generate(req.prompt)
+        
+        # 3. Save to DB with Session ID
+        text_out = out.get("text") or out.get("image_url")
+        session.add(ChatHistory(
+            user_id=user.id, 
+            session_id=req.session_id, 
+            prompt=req.prompt, 
+            response=str(text_out), 
+            model_used=adapter.name
+        ))
+        session.commit()
+        
+        return {"output": out, "model": adapter.name}
+    except Exception as e: 
+        raise HTTPException(500, str(e))
 
+@app.get("/sessions")
+def get_sessions(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    # Get all history for user, ordered by time
+    statement = select(ChatHistory.session_id, ChatHistory.prompt, ChatHistory.timestamp)\
+        .where(ChatHistory.user_id == user.id)\
+        .order_by(ChatHistory.timestamp.desc())
+    results = session.exec(statement).all()
+    
+    # Filter to get unique sessions
+    seen = set()
+    unique_sessions = []
+    for sid, prompt, time in results:
+        if sid not in seen:
+            unique_sessions.append({"id": sid, "title": prompt[:40], "time": time})
+            seen.add(sid)
+    return unique_sessions
 
-
-
-
-
-
-         
-        out = await adapter.generate(prompt)
-    except Exception as e:
-        # --- FALLBACK LOGIC ---
-        # Only fallback if we started with Text. 
-        # (Image fallback is already handled inside GeminiAdapter to ensure we don't ask Groq to draw)
-        if adapter.provider == "groq":
-            # If Groq fails, you could try Gemini Text here if you implemented a GeminiTextAdapter
-            raise HTTPException(status_code=500, detail=f"Groq Failed: {str(e)}")
-        else:
-            raise HTTPException(status_code=500, detail=f"Image Gen Failed: {str(e)}")
-
-    return ChatResponse(
-        model_used=adapter.name,
-        provider=adapter.provider,
-        output={"meta": meta, "result": out}
-    )
+@app.get("/history/{session_id}")
+def get_history(session_id: str, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    return session.exec(select(ChatHistory)
+                        .where(ChatHistory.user_id == user.id, ChatHistory.session_id == session_id)
+                        .order_by(ChatHistory.timestamp)).all()
 
 if __name__ == "__main__":
     import uvicorn
